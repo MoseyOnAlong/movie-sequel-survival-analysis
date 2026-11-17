@@ -1,0 +1,954 @@
+---
+title: "Survival Data Analysis Project"
+output: html_document
+date: "2026-05-10"
+---
+
+```{r setup, include=FALSE}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(tidyverse)
+library(survival)
+library(writexl)
+library(flexsurv)
+library(locfit)
+library(MASS)
+library(smcure)
+library(lmtest)
+library(MuMIn)
+library(muhaz)
+library(ggsurvfit)
+```
+
+```{r}
+# Code used to pull API commented out as data already pulled and stored as CSV
+
+# Set your TMDB API key as an environment variable
+## Sys.setenv(TMDB_API_KEY = "44ffdf26ab2b12e655fda7af52ec833b")
+## api_key <- Sys.getenv("TMDB_API_KEY")
+
+# Function to get movie IDs for a given year
+## get_movie_ids <- function(year, api_key) {
+##   all_movies <- list()
+##   for (page in 1:50) {  # keep this modest to avoid rate limits
+##     url <- paste0(
+##       "https://api.themoviedb.org/3/discover/movie?",
+##       "api_key=", api_key,
+##       "&primary_release_year=", year,
+##       "&sort_by=vote_count.desc",
+##       "&vote_count.gte=500",
+##       "&page=", page
+##     )
+##     res <- GET(url)
+##     data <- fromJSON(content(res, "text", encoding = "UTF-8"))
+##     if (length(data$results) == 0) break
+##     all_movies[[page]] <- data$results
+##   }
+##   bind_rows(all_movies)
+## }
+
+# Function to get detailed movie information for a given movie ID
+## movieDetails <- function(movie_id, api_key) {
+##   url <- paste0(
+##     "https://api.themoviedb.org/3/movie/",
+##     movie_id,
+##     "?api_key=", api_key,
+##     "&append_to_response=credits,keywords"
+##   )
+##   res <- GET(url)
+##   data <- fromJSON(content(res, "text", encoding = "UTF-8"))
+##   # Handle possible NULLs safely
+##   genres <- if (!is.null(data$genres)) 
+##     paste(data$genres$name, collapse = ", ") else NA
+##   production_companies <- if (!is.null(data$production_companies)) 
+##     paste(data$production_companies$name, collapse = ", ") else NA
+##   cast_size <- if (!is.null(data$credits$cast)) 
+##     nrow(data$credits$cast) else NA
+##   director <- if (!is.null(data$credits$crew)) {
+##     dir <- data$credits$crew %>%
+##       filter(job == "Director")
+##     if (nrow(dir) > 0) dir$name[1] else NA
+##   } else NA
+##   keyword_count <- if (!is.null(data$keywords$keywords)) 
+##     nrow(data$keywords$keywords) else NA
+##   collection_flag <- if (!is.null(data$belongs_to_collection)) 1 else 0
+##   collection_name <- if (!is.null(data$belongs_to_collection)) 
+##     data$belongs_to_collection$name else NA
+##   tibble(
+##     id = data$id,
+##     title = data$title,
+##     release_date = data$release_date,
+##     runtime = data$runtime,
+##     vote_average = data$vote_average,
+##     vote_count = data$vote_count,
+##     popularity = data$popularity,
+##     revenue = data$revenue,
+##     budget = data$budget,
+##     original_language = data$original_language,
+##     genres = genres,
+##     production_companies = production_companies,
+##     cast_size = cast_size,
+##     director = director,
+##     keyword_count = keyword_count,
+##     in_collection = collection_flag,
+##     collection_name = collection_name
+##   )
+## }
+
+## years <- 1970:2026
+
+# API call to gather movie IDs for all movies released from 1970 to 2026
+## pullMovies <- map_dfr(years, get_movie_ids, api_key = api_key)
+
+## movieID <- pullMovies$id
+
+# API call for each movie ID to get detailed information and combine into a single data frame
+## moviesAll <- map_dfr(movieID, function(id) {
+##   movieDetails(id, api_key)
+## })
+```
+
+```{r}
+# Data set up
+
+## Below code used to create CSV from API call, but commented out as data already pulled and stored as CSV for faster loading
+## write_csv(moviesAll, "Data/TMDB_Movies_1970_2026.csv")
+
+moviesAll <- read.csv("Data/TMDB_Movies_1970_2026.csv", header = TRUE)
+
+
+# Filter to only non obscure English movies
+moviesClean <- moviesAll %>%
+  filter(
+    revenue > 0,
+    budget > 0,
+    original_language == "en"
+  )
+
+str(moviesAll)
+
+range(moviesAll$vote_count, na.rm = TRUE)
+
+# Create sequel dataframe with days until sequel and collection name
+moviesSequel <- moviesClean %>%
+  mutate(release_date = as.Date(release_date)) %>%
+  
+  # first, create a column for next_release_date for movies in collections only
+  group_by(collection_name) %>%
+  arrange(release_date, .by_group = TRUE) %>%
+  mutate(
+    next_release_date = if (!is.na(collection_name[1])) lead(release_date) else NA
+  ) %>%
+  ungroup() %>%
+  
+  # calculate days_until_sequel safely
+  mutate(
+    days_until_sequel = ifelse(
+      !is.na(next_release_date) & !is.na(release_date),
+      as.numeric(difftime(next_release_date, release_date, units = "days")),
+      NA
+    )
+  )
+
+moviesSequel <- moviesSequel %>%
+  group_by(collection_name) %>%
+  arrange(release_date, .by_group = TRUE) %>%
+  mutate(
+    sequel_number = ifelse(is.na(collection_name), 1, row_number()),
+    sequel_cat = case_when(
+      sequel_number >= 4 ~ ">3",
+      TRUE ~ as.character(sequel_number)
+    )
+  ) %>%
+  ungroup()
+
+moviesSequel$sequel_cat <- factor(moviesSequel$sequel_cat,levels = c("1", "2", "3", ">3"))
+
+# Find the number of movies in each collection (collections may be NA)
+collection_counts <- moviesSequel %>%
+  group_by(collection_name) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# Find each individual genre and count how many movies in each genre (genres may be comma delimited)
+genre_counts <- moviesSequel %>%
+  filter(!is.na(genres)) %>%
+  separate_rows(genres, sep = ", ") %>%
+  group_by(genres) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# Add flag for each genre in genre_counts
+moviesSequel <- moviesSequel %>%
+  mutate(
+    is_action = ifelse(grepl("Action", genres), 1, 0),
+    is_adventure = ifelse(grepl("Adventure", genres), 1, 0),
+    is_animation = ifelse(grepl("Animation", genres), 1, 0),
+    is_comedy = ifelse(grepl("Comedy", genres), 1, 0),
+    is_crime = ifelse(grepl("Crime", genres), 1, 0),
+    is_documentary = ifelse(grepl("Documentary", genres), 1, 0),
+    is_drama = ifelse(grepl("Drama", genres), 1, 0),
+    is_family = ifelse(grepl("Family", genres), 1, 0),
+    is_fantasy = ifelse(grepl("Fantasy", genres), 1, 0),
+    is_history = ifelse(grepl("History", genres), 1, 0),
+    is_horror = ifelse(grepl("Horror", genres), 1, 0),
+    is_music = ifelse(grepl("Music", genres), 1, 0),
+    is_mystery = ifelse(grepl("Mystery", genres), 1, 0),
+    is_romance = ifelse(grepl("Romance", genres), 1, 0),
+    is_science_fiction = ifelse(grepl("Science Fiction", genres), 1, 0),
+    is_tv_movie = ifelse(grepl("TV Movie", genres), 1, 0),
+    is_thriller = ifelse(grepl("Thriller", genres), 1, 0),
+    is_war = ifelse(grepl("War", genres), 1, 0),
+    is_western = ifelse(grepl("Western", genres), 1, 0)
+  )
+
+genre_vars <- c(
+  "is_action", "is_adventure", "is_animation", "is_comedy", "is_crime",
+  "is_documentary", "is_drama", "is_family", "is_fantasy", "is_history",
+  "is_horror", "is_music", "is_mystery", "is_romance",
+  "is_science_fiction", "is_thriller", "is_war", "is_western"
+)
+
+genre_summary <- data.frame(
+
+  # how many movies are in each genre
+  count = sapply(genre_vars, function(g) sum(moviesSequel[[g]], na.rm = TRUE)),
+
+  # % of all movies that belong to this genre
+  genre_percent = sapply(genre_vars, function(g)
+    sum(moviesSequel[[g]], na.rm = TRUE) / nrow(moviesSequel) * 100
+  ),
+
+  # % of movies in this genre that get sequels
+  sequel_percent = sapply(genre_vars, function(g) {
+    denom <- sum(moviesSequel[[g]] == 1, na.rm = TRUE)
+    if (denom == 0) return(NA_real_)
+
+    num_with_sequel <- sum(
+      moviesSequel[[g]] == 1 &
+      !is.na(moviesSequel$days_until_sequel),
+      na.rm = TRUE
+    )
+
+    num_with_sequel / denom * 100
+  })
+)
+
+genre_matrix <- moviesSequel[, genre_vars]
+genre_cor <- cor(genre_matrix)
+
+# Create years column by dividing days_until_sequel by 365.25 to account for leap years
+moviesSequel$months_until_sequel <- moviesSequel$days_until_sequel / 30.44
+moviesSequel$years_until_sequel <- moviesSequel$days_until_sequel / 365.25
+moviesSequel$decade <- (as.integer(format(moviesSequel$release_date, "%Y")) %/% 10) * 10
+
+# Create survival data
+moviesSequel$censor <- ifelse(is.na(moviesSequel$days_until_sequel), 0, 1)
+moviesSequel$time <- ifelse(is.na(moviesSequel$days_until_sequel), as.Date("2026-2-26") - moviesSequel$release_date, moviesSequel$days_until_sequel)
+
+# Read in CPI data to get CPI adjusted revenue and budget
+CPI <- read_csv("C:/Users/zmose/OneDrive/Desktop/Data Sets/CPI1970-2026.csv", na ="NA")
+
+#Get year and month from date column and create year_month column
+CPI <- CPI %>%
+  mutate(year = as.numeric(format(as.Date(observation_date, format="%Y-%m-%d"), "%Y")),
+       month = as.numeric(format(as.Date(observation_date, format="%Y-%m-%d"), "%m")),
+       year_month = paste(year, month, sep="-"))
+moviesSequel <- moviesSequel %>%
+  mutate(release_year = as.numeric(format(release_date, "%Y")),
+         release_month = as.numeric(format(release_date, "%m")),
+         release_year_month = paste(release_year, release_month, sep="-"))
+
+#Add CPIAUCSL column to moviesSequel by matching release_year_month with year_month in CPI
+moviesSequel <- moviesSequel %>%
+  left_join(
+    dplyr::select(CPI, year_month, CPIAUCSL),
+    by = c("release_year_month" = "year_month")
+  )
+base_cpi <- CPI %>%
+  filter(observation_date <= as.Date("2026-02-26")) %>%
+  arrange(desc(observation_date)) %>%
+  slice(1) %>%
+  pull(CPIAUCSL)
+moviesSequel <- moviesSequel %>%
+  mutate(
+    CPIAdjustedRevenue = ifelse(!is.na(revenue) & !is.na(CPIAUCSL),
+                            revenue * (base_cpi / CPIAUCSL),
+                            NA_real_),
+    CPIAdjustedBudget = ifelse(!is.na(budget) & !is.na(CPIAUCSL),
+                            budget * (base_cpi / CPIAUCSL),
+                            NA_real_)
+  )
+
+# Create survival object using time and censor columns
+moviesSequel <- moviesSequel %>%
+  mutate(response = Surv(time, censor))
+
+# Check structure of moviesSequel to all columns are correct
+str(moviesSequel)
+
+
+# Remove all movies released after 2019
+moviesSequel2 <- moviesSequel %>%
+  filter(release_date <= as.Date("2019-12-31"))
+
+# See rates of sequels at particular cut offs
+cuts <- quantile(moviesSequel2$CPIAdjustedRevenue, probs = seq(0.1, 0.9, 0.1), na.rm = TRUE)
+data.frame(
+  cutoff = cuts,
+  n_movies = sapply(cuts, function(cut) {
+    sum(moviesSequel2$CPIAdjustedRevenue > cut, na.rm = TRUE)
+  }),
+  sequel_rate = sapply(cuts, function(cut) {
+    df <- moviesSequel2 %>% filter(CPIAdjustedRevenue > cut)
+    mean(!is.na(df$days_until_sequel)) * 100
+  })
+)
+
+
+# One final filter to only include movies with CPI adjusted revenue greater than 10 million and CPI adjusted budget greater than 10 thousand IF they don't have any sequels
+moviesFinal <- moviesSequel2 %>%
+  filter(
+    CPIAdjustedRevenue > 100000000 & CPIAdjustedBudget > 15000
+  )
+
+# Percent of days_until_sequel that are not NA
+sum(!is.na(moviesFinal$days_until_sequel)) / nrow(moviesFinal) * 100
+
+sequelPercentageFinal<-moviesFinal %>%
+  summarise(
+    action_percent = sum(!is.na(days_until_sequel) & is_action == 1) / sum(is_action == 1) * 100,
+    adventure_percent = sum(!is.na(days_until_sequel) & is_adventure == 1) / sum(is_adventure == 1) * 100,
+    animation_percent = sum(!is.na(days_until_sequel) & is_animation == 1) / sum(is_animation == 1) * 100,
+    comedy_percent = sum(!is.na(days_until_sequel) & is_comedy == 1) / sum(is_comedy == 1) * 100,
+    crime_percent = sum(!is.na(days_until_sequel) & is_crime == 1) / sum(is_crime == 1) * 100,
+    documentary_percent = sum(!is.na(days_until_sequel) & is_documentary == 1) / sum(is_documentary == 1) * 100,
+    drama_percent = sum(!is.na(days_until_sequel) & is_drama == 1) / sum(is_drama == 1) * 100,
+    family_percent = sum(!is.na(days_until_sequel) & is_family == 1) / sum(is_family == 1) * 100,
+    fantasy_percent = sum(!is.na(days_until_sequel) & is_fantasy == 1) / sum(is_fantasy == 1) * 100,
+    history_percent = sum(!is.na(days_until_sequel) & is_history == 1) / sum(is_history == 1) * 100,
+    horror_percent = sum(!is.na(days_until_sequel) & is_horror == 1) / sum(is_horror == 1) * 100,
+    music_percent = sum(!is.na(days_until_sequel) & is_music == 1) / sum(is_music == 1) * 100,
+    mystery_percent = sum(!is.na(days_until_sequel) & is_mystery == 1) / sum(is_mystery == 1) * 100,
+    romance_percent = sum(!is.na(days_until_sequel) & is_romance == 1) / sum(is_romance == 1) * 100,
+    science_fiction_percent = sum(!is.na(days_until_sequel) & is_science_fiction == 1) / sum(is_science_fiction == 1) * 100,
+    tv_movie_percent = sum(!is.na(days_until_sequel) & is_tv_movie == 1) / sum(is_tv_movie == 1) * 100,
+    thriller_percent = sum(!is.na(days_until_sequel) & is_thriller == 1) / sum(is_thriller == 1) * 100,
+    war_percent = sum(!is.na(days_until_sequel) & is_war == 1) / sum(is_war == 1)
+  )
+
+# Find the number of movies in each collection (collections may be NA)
+collection_counts2 <- moviesFinal %>%
+  group_by(collection_name) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+moviesFit <- survfit(response ~ 1, data = moviesFinal)
+
+year_lines <- seq(365, max(moviesFinal$time, na.rm = TRUE), by = 365)
+decade_lines <- seq(3650, max(moviesFinal$time, na.rm = TRUE), by = 3650)
+survfit2(Surv(time, censor) ~ 1, data = moviesFinal) %>%
+  ggsurvfit() +
+  labs(
+    title = "Kaplan-Meier Survival Curve for Time Until Sequel",
+    x = "Time (days)",
+    y = "Survival Probability"
+  ) +
+  add_confidence_interval() +
+  add_risktable() +
+  geom_vline(xintercept = year_lines, linetype = "dotted", color = "lightgrey") +
+  geom_vline(xintercept = decade_lines, linetype = "dashed", color = "darkgrey") +
+  theme_classic()
+
+plot(moviesFit,
+     conf.int = TRUE,
+     main = "Kaplan-Meier Survival Curve for Time Until Sequel",
+     xlab = "Time (days)",
+     ylab = "Survival Probability",
+     lwd=3)
+
+# Light grey yearly lines
+for (t in seq(365, max(moviesFit$time), by = 365)) {
+  abline(v = t, col = "grey90", lty = 3)
+}
+
+# Darker grey lines every 10 years
+for (t in seq(3650, max(moviesFit$time), by = 3650)) {
+  abline(v = t, col = "grey60", lty = 2, lwd = 1.2)
+}
+
+plot(moviesFit,
+     conf.int = FALSE,
+     fun = "cumhaz",
+     main = "Cumulative Hazard Function for Time Until Sequel",
+     xlab = "Time (days)",
+     ylab = "Cumulative Hazard",
+     lwd=3)
+
+# Light grey yearly lines
+for (t in seq(365, max(moviesFit$time), by = 365)) {
+  abline(v = t, col = "grey90", lty = 3)
+}
+
+# Darker grey lines every 10 years
+for (t in seq(3650, max(moviesFit$time), by = 3650)) {
+  abline(v = t, col = "grey60", lty = 2, lwd = 1.2)
+}
+
+haz <- muhaz(moviesFinal$time, moviesFinal$censor)
+plot.muhaz(haz,
+           main = "Smoothed Hazard Function for Time Until Sequel",
+           xlab = "Time (days)", ylab = "Hazard Rate")
+lines(haz, lwd = 3)
+
+# Light grey yearly lines
+for (t in seq(365, max(moviesFit$time), by = 365)) {
+  abline(v = t, col = "grey90", lty = 3)
+}
+
+# Darker grey lines every 10 years
+for (t in seq(3650, max(moviesFit$time), by = 3650)) {
+  abline(v = t, col = "grey60", lty = 2, lwd = 1.2)
+}
+
+#Find movie sequels with time = 0
+moviesFinal %>%
+  filter(time <= 1) %>%
+  dplyr::select(title, time, release_date, next_release_date, collection_name)
+
+
+moviesFinal <- moviesFinal %>%
+  mutate(
+    revenue_mil = revenue / 1e6,
+    budget_mil = budget / 1e6,
+    CPIAdjustedRevenue_tmil = CPIAdjustedRevenue / 1e7,
+    CPIAdjustedBudget_mil = CPIAdjustedBudget / 1e6,
+    vote_count_k = vote_count / 1e3,
+    runtime_hr = runtime / 60,
+
+    log_budget = log(CPIAdjustedBudget_mil),
+    log_revenue = log(CPIAdjustedRevenue_tmil)
+  )
+
+summary(moviesFinal)
+
+
+# For SAS export
+write.csv(moviesFinal, "moviesFinal.csv", row.names = FALSE)
+```
+
+```{r}
+# Fun facts
+# Movie with the longest time until sequel
+moviesFinal %>%
+  filter(!is.na(days_until_sequel)) %>%
+  arrange(desc(days_until_sequel)) %>%
+  dplyr::select(title, years_until_sequel, collection_name) %>%
+  head(10)
+
+# Movie with the shortest time until sequel
+moviesFinal %>%
+  filter(!is.na(days_until_sequel)) %>%
+  arrange(days_until_sequel) %>%
+  dplyr::select(title, time, collection_name) %>%
+  head(10)
+
+# Collection with most sequels
+moviesFinal %>%
+  filter(in_collection == 1) %>%
+  group_by(collection_name) %>%
+  summarise(n_sequels = sum(!is.na(days_until_sequel))) %>%
+  arrange(desc(n_sequels)) %>%
+  head(10)
+
+# Highest positive difference between revenue and budget without a sequel
+moviesFinal %>%
+  filter(is.na(days_until_sequel)) %>%
+  mutate(revenue_budget_diff = CPIAdjustedRevenue - CPIAdjustedBudget) %>%
+  arrange(desc(revenue_budget_diff)) %>%
+  dplyr::select(title, revenue_budget_diff, collection_name) %>%
+  head(10)
+
+# Lowest difference between revenue and budget without a sequel
+moviesFinal %>%
+  filter(!is.na(days_until_sequel)) %>%
+  mutate(profit = CPIAdjustedRevenue - CPIAdjustedBudget) %>%
+  arrange(profit) %>%
+  dplyr::select(title, profit, collection_name) %>%
+  head(10)
+
+# A quiet place sequel
+moviesFinal %>%
+  filter(grepl("James Bond", collection_name)) %>%
+  dplyr::select(title, time, censor, collection_name)
+
+# I know what you did last summer sequel
+moviesFinal %>%
+  filter(grepl("", collection_name)) %>%
+  dplyr::select(title, time, censor, collection_name)
+```
+
+
+```{r}
+# Test
+
+KMfitCollections <- survfit(
+  Surv(
+    moviesFinal$time[moviesFinal$in_collection == 1],
+    moviesFinal$censor[moviesFinal$in_collection == 1]
+  ) ~ 1
+)
+
+plot(KMfitCollections,
+     conf.int = FALSE,
+     mark.time = FALSE,
+     main = "Kaplan-Meier Survival Curve for Time Until Sequel by Collection Status",
+     xlab = "Time (days)",
+     ylab = "Survival Probability",
+     col = "blue")
+lines(moviesFit, conf.int = FALSE, mark.time = FALSE, col = "black")
+
+# Survival probability at 1 year, 5 years, and 10 years for movies in collections vs overall
+surv_summary <- summary(moviesFit, times = c(365, 365*5, 365*10))
+```
+
+
+
+
+```{r}
+# Category analysis
+
+# PCA Analysis
+
+X <- moviesFinal[, genre_vars]
+pca_fit <- prcomp(X, scale. = TRUE)
+summary(pca_fit)
+plot(pca_fit, type = "l", main = "Scree Plot")
+
+loadings <- pca_fit$rotation
+round(loadings[,1:5], 2)
+##PC1: Light vs dark tone
+##PC2: Action/sci-fi vs romance/drama
+##PC3: Historical seriousness vs horror/mystery
+##PC4: Romance/comedy vs historical content
+##PC5: Crime realism vs horror/sci-fi
+round(loadings[,1:4], 2)
+##PC1: Genre intensity spectrum (family/comedy/animation vs thriller/crime/drama)
+##PC2: Action/sci-fi spectacle vs romance/drama narratives
+##PC3: Historical/war context vs horror/mystery genres
+##PC4: Romance/comedy orientation vs structured/historical content
+
+## Above PC analysis creates bins of genres with too little overlap. Attempting to reorganize based on correlations
+
+genre_matrix <- moviesFinal[, genre_vars]
+co_matrix <- t(genre_matrix) %*% as.matrix(genre_matrix)
+overlap_matrix <- co_matrix / diag(co_matrix)
+
+high_overlap <- which(overlap_matrix > 0.5 & overlap_matrix < 1, arr.ind = TRUE)
+
+# Convert to readable pairs
+overlap_pairs <- data.frame(
+   genre1 = rownames(overlap_matrix)[high_overlap[,1]],
+   genre2 = colnames(overlap_matrix)[high_overlap[,2]],
+   overlap = overlap_matrix[high_overlap])
+
+# Sort by strongest overlap
+overlap_pairs <- overlap_pairs[order(-overlap_pairs$overlap), ]
+
+overlap_pairs
+
+genre_vars <- c(
+  "is_action","is_adventure","is_animation","is_comedy","is_crime",
+  "is_documentary","is_drama","is_family","is_fantasy","is_history",
+  "is_horror","is_music","is_mystery","is_romance",
+  "is_science_fiction","is_thriller","is_war","is_western"
+)
+
+# Reorganizing the genre bins for each
+
+dist_mat <- as.dist(1 - overlap_matrix)
+hc <- hclust(dist_mat, method = "average")
+clusters <- cutree(hc, k = 5)
+genre_clusters <- data.frame(
+   genre = names(clusters),
+   cluster = clusters
+)
+genre_clusters
+
+moviesFinal <- moviesFinal %>%
+  mutate(
+    genre_action = ifelse(
+      is_action + is_crime + is_science_fiction + is_thriller > 0, 1, 0
+    ),
+    genre_entertainment = ifelse(
+      is_adventure + is_animation + is_comedy + is_family +
+      is_fantasy + is_music + is_western > 0, 1, 0
+    ),
+    genre_drama = ifelse(
+      is_drama + is_history + is_romance + is_war > 0, 1, 0
+    ),
+    genre_horror = ifelse(
+      is_horror + is_mystery > 0, 1, 0
+    ),
+    genre_documentary = ifelse(
+      is_documentary > 0, 1, 0
+    )
+  )
+
+CoxFit2 <- coxph(response ~ runtime_hr + vote_average + vote_count + popularity + cast_size + is_action + is_adventure + is_animation + is_comedy + is_crime + is_documentary + is_drama + is_family + is_fantasy + is_history + is_horror + is_music + is_mystery + is_romance + is_science_fiction +is_thriller + is_war + is_western + factor(decade) + log_budget + log_revenue + strata(factor(sequel_cat)), ties = "breslow", data = moviesFinal)
+
+CoxFitGenreBins <- coxph(response ~ runtime_hr + vote_average + vote_count + popularity + cast_size + genre_action + genre_entertainment + genre_drama + genre_horror + genre_documentary + factor(decade) + log_budget + log_revenue + strata(factor(sequel_cat)), ties = "breslow", data = moviesFinal)
+
+lrtest(CoxFitGenreBins, CoxFit2)
+AIC(CoxFitGenreBins)
+AIC(CoxFit2)
+```
+
+
+```{r}
+# ATF
+ExpFit <- flexsurvreg(Surv(time, censor) ~ 1, dist = "exponential", data = moviesFinal)
+WeiFit <- flexsurvreg(Surv(time, censor) ~ 1, dist = "weibull", data = moviesFinal)
+GammaFit <- flexsurvreg(Surv(time, censor) ~ 1, dist = "gamma", data = moviesFinal)
+LNfit <- flexsurvreg(Surv(time, censor) ~ 1, dist = "lognormal", data = moviesFinal)
+GGammaFit <- flexsurvreg(Surv(time, censor) ~ 1, dist = "gengamma", data = moviesFinal)
+LLogFit <- flexsurvreg(Surv(time, censor) ~ 1, dist = "llogis", data = moviesFinal)
+
+plot(ExpFit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Exponential and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability", lwd=2, col="red")
+lines(WeiFit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Weibull and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability", lwd=2, col="blue")
+lines(GammaFit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Gamma and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability", lwd=2, col="green")
+lines(LNfit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Lognormal and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability", lwd=2, col="purple")
+lines(LLogFit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Log-Logistic and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability", lwd=2, col="orange")
+lines(GGammaFit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Generalized Gamma and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability", lwd=2, col="brown")
+lines(moviesFit, conf.int=FALSE, mark.time=FALSE, col="black", lwd=4)
+legend("bottomleft", legend=c("Exponential", "Weibull", "Gamma", "Lognormal", "Log-Logistic", "Generalized Gamma"), col=c("red", "blue", "green", "purple", "orange", "brown"), lwd=2, cex=0.8)
+AIC(ExpFit, WeiFit, GammaFit, LNfit, GGammaFit, LLogFit)
+
+plot(GGammaFit, conf.int=FALSE, ci=FALSE, mark.time=FALSE, main="Comparison of Generalized Gamma and K-M Survival Curves", xlab="Time in Days", ylab="Survival Probability",lwd=2, col="brown")
+plot(GGammaFit,type="cumhaz",conf.int=FALSE,ci=FALSE, main="Comparing Generalized Gamma AFT and Kaplan-Meier Cumulative Hazard",xlab="Time in Days", ylab="Cumulative Hazard",lwd=2, col="brown")
+
+
+
+minFit <- flexsurvreg(Surv(time, censor) ~ 1,
+                       data = moviesFinal,
+                       dist = "gengamma")
+fullFit <- flexsurvreg(response ~ runtime_hr + vote_average + vote_count_k + cast_size + is_action + is_adventure + is_animation + is_comedy + is_crime + is_documentary + is_drama + is_family + is_fantasy + is_history + is_horror + is_music + is_mystery + is_romance + is_science_fiction + is_thriller + is_war + is_western + factor(decade) + log_budget + log_revenue + factor(sequel_cat),
+                       dist = "gengamma",
+                       data = moviesFinal)
+
+summary(fullFit)
+
+make_group_data <- function(df, group_val) {
+  subset_df <- df[df$sequel_cat == group_val, ]
+
+  data.frame(
+    runtime_hr = mean(subset_df$runtime_hr, na.rm = TRUE),
+    vote_average = mean(subset_df$vote_average, na.rm = TRUE),
+    vote_count_k = mean(subset_df$vote_count_k, na.rm = TRUE),
+    popularity = mean(subset_df$popularity, na.rm = TRUE),
+    cast_size = mean(subset_df$cast_size, na.rm = TRUE),
+
+    is_action = mean(subset_df$is_action, na.rm = TRUE),
+    is_adventure = mean(subset_df$is_adventure, na.rm = TRUE),
+    is_animation = mean(subset_df$is_animation, na.rm = TRUE),
+    is_comedy = mean(subset_df$is_comedy, na.rm = TRUE),
+    is_crime = mean(subset_df$is_crime, na.rm = TRUE),
+    is_documentary = mean(subset_df$is_documentary, na.rm = TRUE),
+    is_drama = mean(subset_df$is_drama, na.rm = TRUE),
+    is_family = mean(subset_df$is_family, na.rm = TRUE),
+    is_fantasy = mean(subset_df$is_fantasy, na.rm = TRUE),
+    is_history = mean(subset_df$is_history, na.rm = TRUE),
+    is_horror = mean(subset_df$is_horror, na.rm = TRUE),
+    is_music = mean(subset_df$is_music, na.rm = TRUE),
+    is_mystery = mean(subset_df$is_mystery, na.rm = TRUE),
+    is_romance = mean(subset_df$is_romance, na.rm = TRUE),
+    is_science_fiction = mean(subset_df$is_science_fiction, na.rm = TRUE),
+    is_thriller = mean(subset_df$is_thriller, na.rm = TRUE),
+    is_war = mean(subset_df$is_war, na.rm = TRUE),
+    is_western = mean(subset_df$is_western, na.rm = TRUE),
+
+    decade = median(subset_df$decade, na.rm = TRUE),
+
+    log_budget = mean(subset_df$log_budget, na.rm = TRUE),
+    log_revenue = mean(subset_df$log_revenue, na.rm = TRUE),
+
+    sequel_cat = factor(group_val, levels = levels(df$sequel_cat))
+  )
+}
+
+newdata <- do.call(rbind, lapply(levels(moviesFinal$sequel_cat),
+                                 function(g) make_group_data(moviesFinal, g)))
+
+cols <- 1:4
+plot(km_fit,
+     col = cols,
+     lwd = 2,
+     lty = 1,
+     xlab = "Time in Days",
+     ylab = "Survival Probability",
+     main = "KM vs AFT Survival by Sequel Category")
+lines(fullFit,
+      newdata = newdata,
+      col = cols,
+      lwd = 2,
+      lty = 2,
+      ci = FALSE)
+legend("bottomleft",
+       legend = levels(moviesFinal$sequel_cat),
+       col = cols,
+       lwd = 2,
+       lty = 1,
+       title = "KM (solid) vs AFT (dashed)",
+       cex = 0.5)
+
+plot(km_fit,
+     fun = "cumhaz",
+     col = cols,
+     lwd = 2,
+     lty = 1,
+     xlab = "Time in Days",
+     ylab = "Cumulative Hazard",
+     main = "KM vs AFT Cumulative Hazard by Sequel Category")
+lines(fullFit,
+      newdata = newdata,
+      type = "cumhaz",
+      col = cols,
+      lwd = 2,
+      lty = 2,
+      ci = FALSE)
+legend("right",
+       legend = levels(moviesFinal$sequel_cat),
+       col = cols,
+       lwd = 2,
+       lty = 1,
+       title = "KM (solid) vs AFT (dashed)",
+       cex = 0.5)
+
+# Plots show that the ATF model is probably not the best fit for the data, as the predicted cumulative hazard and survival curves do not align well with the Kaplan-Meier estimates. ATF model is likely overfitting the data with too many covariates and not capturing the underlying hazard function accurately. The predicted cumulative hazard curve is much steeper than the Kaplan-Meier estimate, and the predicted survival curve drops much more quickly than the Kaplan-Meier curve, indicating that the model may be overestimating the hazard of a sequel occurring. Will likely need to use Cox PH model to better capture the effects of covariates on the hazard of a sequel occurring without making strong assumptions about the baseline hazard function.
+```
+
+```{r}
+#Cox Model
+
+CoxFit <- coxph(response ~ runtime_hr + vote_average + vote_count_k + popularity + cast_size + is_action + is_adventure + is_animation + is_comedy + is_crime + is_documentary + is_drama + is_family + is_fantasy + is_history + is_horror + is_music + is_mystery + is_romance +is_science_fiction + is_thriller + is_war + is_western + decade + log_budget + log_revenue + strata(factor(sequel_cat)),
+                ties = "breslow",
+                data = moviesFinal)
+
+CoxFit2 <- coxph(response ~ runtime_hr + vote_average + vote_count_k + popularity + cast_size + is_action + is_adventure + is_animation + is_comedy + is_crime + is_documentary + is_drama + is_family + is_fantasy + is_history + is_horror + is_music + is_mystery + is_romance + is_science_fiction +is_thriller + is_war + is_western + factor(decade) + log_budget + log_revenue + strata(factor(sequel_cat)),
+                 ties = "breslow",
+                 data = moviesFinal)
+
+lrtest(CoxFit, CoxFit2)
+
+summary(CoxFit2)
+
+stepAIC(CoxFit2, trace=FALSE)
+
+CoxFinal <- coxph(response ~ runtime + vote_count_k + cast_size + 
+    is_action + is_animation + is_drama + is_horror + is_music + 
+    is_romance + is_science_fiction + is_thriller + is_war + 
+    factor(decade) + log_budget + log_revenue + strata(factor(sequel_cat)), 
+    data = moviesFinal, ties = "breslow")
+
+summary(CoxFinal)
+
+plot(survfit(CoxFinal),
+     lwd = 2,
+     mark.time = FALSE,
+     conf.int = FALSE,
+     col = 1:length(survfit(CoxFinal)$strata),
+     main = "Stratified Cox Model Baseline Survival by Sequel Category",
+     xlab = "Time (Days)",
+     ylab = "Survival Probability")
+
+legend("bottomleft",
+       legend = names(survfit(CoxFinal)$strata),
+       col = 1:length(survfit(CoxFinal)$strata),
+       lwd = 2)
+
+plot(survfit(CoxFinal),
+     lwd = 2,
+     mark.time = FALSE,
+     conf.int = FALSE,
+     col = 1:length(survfit(CoxFinal)$strata),
+     fun = "cumhaz",
+     main = "Stratified Cox Model: Cumulative Hazard by Sequel Category",
+     xlab = "Time (Days)",
+     ylab = "Cumulative Hazard")
+
+legend("right",
+       legend = names(survfit(CoxFinal)$strata),
+       col = 1:length(survfit(CoxFinal)$strata),
+       lwd = 2)
+
+
+phcheck <- cox.zph(CoxFinal)
+phcheck
+#Iterate through each variable and plot Schoenfield residuals
+vars <- rownames(phcheck$table)
+vars <- vars[vars != "GLOBAL"]
+for (i in seq_along(vars)) {
+  plot(phcheck, var = i, main = paste("Schoenfeld Residual Plot for", vars[i]))
+  abline(h = 0, lty = 3)
+}
+
+CoxFinal2 <- coxph(response ~ runtime_hr + vote_count_k + cast_size + is_action + is_animation + is_drama + is_horror + is_music + is_romance + is_science_fiction + is_thriller + is_war +factor(decade) + log_budget + log_revenue + strata(factor(sequel_cat)) + tt(vote_count_k) + tt(is_animation),data = moviesFinal, ties = "breslow", tt = function(x, t, ...) x * log(t))
+
+CoxFinal3 <- coxph(response ~ runtime_hr + vote_count_k + cast_size + is_action + is_animation + is_drama + is_horror + is_music + is_romance + is_science_fiction + is_thriller + is_war +factor(decade) + log_budget + log_revenue + strata(factor(sequel_cat)) + tt(vote_count_k) + tt(is_animation) + tt(log_budget) + tt(log_revenue),data = moviesFinal, ties = "breslow", tt = function(x, t, ...) x * log(t))
+
+lrtest(CoxFinal, CoxFinal2)
+lrtest(CoxFinal3, CoxFinal2)
+
+stepAIC(CoxFinal3)
+# Final model is CoxFinal2, which includes time-varying effects for vote_count_k and is_animation, as these were the only two variables that showed significant violations of the proportional hazards assumption.
+```
+
+```{r}
+#Cure model
+
+cure_model <- smcure(
+  Surv(time, censor) ~ runtime_hr + vote_count + cast_size +
+    is_action + is_animation + is_drama + is_horror + is_music +
+    is_romance + is_science_fiction + is_thriller + is_war +
+    factor(decade) + log_budget + log_revenue,
+
+  cureform = ~ runtime_hr + vote_count + cast_size +
+    is_action + is_animation + is_drama + is_horror + is_music +
+    is_romance + is_science_fiction + is_thriller + is_war +
+    factor(decade) + log_budget + log_revenue,
+
+  data = moviesFinal,
+  model = "ph"
+)
+```
+
+```{r}
+# Outlier analysis
+
+dfb <- residuals(CoxFinal, type="dfbetas")
+ldresids <- residuals(CoxFinal, type="deviance")
+colnames(dfb) <- paste0("dfbeta_", names(coef(CoxFinal)))
+moviesFinal2 <- moviesFinal %>%
+  dplyr::select(id, title, everything()) %>%
+  cbind(dfb, ldresids)
+
+moviesFinal2 %>%
+  filter(dfbeta_runtime_hr > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_runtime_hr)) %>%
+  dplyr::select(title, dfbeta_runtime_hr)
+
+moviesFinal2 %>%
+  filter(dfbeta_vote_count > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_vote_count)) %>%
+  dplyr::select(title, dfbeta_vote_count)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_action > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_action)) %>%
+  dplyr::select(title, dfbeta_is_action)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_animation > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_animation)) %>%
+  dplyr::select(title, dfbeta_is_animation)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_drama > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_drama)) %>%
+  dplyr::select(title, dfbeta_is_drama)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_horror > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_horror)) %>%
+  dplyr::select(title, dfbeta_is_horror)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_music > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_music)) %>%
+  dplyr::select(title, dfbeta_is_music)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_romance > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_romance)) %>%
+  dplyr::select(title, dfbeta_is_romance)
+
+moviesFinal2 %>%
+  filter(dfbeta_is_science_fiction > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(dfbeta_is_science_fiction)) %>%
+  dplyr::select(title, dfbeta_is_science_fiction)
+
+moviesFinal2 %>%
+  filter(`dfbeta_log_budget` > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(`dfbeta_log_budget`)) %>%
+  dplyr::select(title, `dfbeta_log_budget`)
+
+moviesFinal2 %>%
+  filter(`dfbeta_log_revenue` > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(`dfbeta_log_revenue`)) %>%
+  dplyr::select(title, `dfbeta_log_revenue`)
+
+moviesFinal2 %>%
+  filter(`dfbeta_factor(decade)1980` > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(`dfbeta_factor(decade)1980`)) %>%
+  dplyr::select(title, `dfbeta_factor(decade)1980`)
+
+moviesFinal2 %>%
+  filter(`dfbeta_factor(decade)1990` > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(`dfbeta_factor(decade)1990`)) %>%
+  dplyr::select(title, `dfbeta_factor(decade)1990`)
+
+moviesFinal2 %>%
+  filter(`dfbeta_factor(decade)2000` > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(`dfbeta_factor(decade)2000`)) %>%
+  dplyr::select(title, `dfbeta_factor(decade)2000`)
+
+moviesFinal2 %>%
+  filter(`dfbeta_factor(decade)2010` > 2/sqrt(nrow(moviesFinal2))) %>%
+  arrange(desc(`dfbeta_factor(decade)2010`)) %>%
+  dplyr::select(title, `dfbeta_factor(decade)2010`)
+
+moviesFinal2 %>%
+  filter(abs(ldresids) > 2) %>%
+  arrange(desc(abs(ldresids))) %>%
+  dplyr::select(title, ldresids)
+
+thresh <- 2 / sqrt(nrow(moviesFinal2))
+thresh_df <- data.frame(
+  runtime_hr   = abs(moviesFinal2$dfbeta_runtime_hr) > thresh,
+  vote_count   = abs(moviesFinal2$dfbeta_vote_count) > thresh,
+  action       = abs(moviesFinal2$dfbeta_is_action) > thresh,
+  animation    = abs(moviesFinal2$dfbeta_is_animation) > thresh,
+  drama        = abs(moviesFinal2$dfbeta_is_drama) > thresh,
+  horror       = abs(moviesFinal2$dfbeta_is_horror) > thresh,
+  music        = abs(moviesFinal2$dfbeta_is_music) > thresh,
+  romance      = abs(moviesFinal2$dfbeta_is_romance) > thresh,
+  sci_fi       = abs(moviesFinal2$dfbeta_is_science_fiction) > thresh,
+  log_budget   = abs(moviesFinal2$dfbeta_log_budget) > thresh,
+  log_revenue  = abs(moviesFinal2$dfbeta_log_revenue) > thresh,
+  dec_1980     = abs(moviesFinal2$`dfbeta_factor(decade)1980`) > thresh,
+  dec_1990     = abs(moviesFinal2$`dfbeta_factor(decade)1990`) > thresh,
+  dec_2000     = abs(moviesFinal2$`dfbeta_factor(decade)2000`) > thresh,
+  dec_2010     = abs(moviesFinal2$`dfbeta_factor(decade)2010`) > thresh,
+  ldresid      = abs(moviesFinal2$ldresids) > 2
+)
+
+largestOutliers <- moviesFinal2 %>%
+  arrange(desc(thresh_df)) %>%
+  dplyr::select(
+    title,
+    runtime,
+    vote_count,
+    cast_size,
+    is_action, is_animation, is_drama, is_horror,
+    is_music, is_romance, is_science_fiction,
+    is_thriller, is_war,
+    decade,
+    sequel_cat,
+    CPIAdjustedRevenue,
+    CPIAdjustedBudget
+  ) %>%
+  head(10)
+largestOutliers
+```
